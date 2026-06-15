@@ -1,17 +1,13 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import accuracy_score
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping
 import time
 import warnings
 warnings.filterwarnings("ignore")
@@ -79,7 +75,7 @@ def add_indicators(df):
     df.dropna(inplace=True)
     return df
 
-def prepare_lstm_data(df, lookahead=5, threshold=0.0003, window=30):
+def prepare_data(df, lookahead=5, threshold=0.0003):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     close = df["Close"].squeeze()
@@ -99,60 +95,35 @@ def prepare_lstm_data(df, lookahead=5, threshold=0.0003, window=30):
         "Volume_ratio","Volume_surge",
         "HH","LL","Price_change","Volatility"
     ]
-    X_raw = df[features].values
-    y_raw = df["Target"].values
+    X = df[features].values
+    y = df["Target"].values
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
-    X_seq, y_seq = [], []
-    for i in range(window, len(X_scaled)):
-        X_seq.append(X_scaled[i-window:i])
-        y_seq.append(y_raw[i])
-    return np.array(X_seq), np.array(y_seq), scaler, features, df
-
-def build_lstm(input_shape):
-    inputs = tf.keras.Input(shape=input_shape)
-    x = LSTM(256, return_sequences=True)(inputs)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    x = LSTM(128, return_sequences=True)(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    x = LSTM(64, return_sequences=False)(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.2)(x)
-    x = Dense(32, activation="relu")(x)
-    x = Dropout(0.2)(x)
-    outputs = Dense(1, activation="sigmoid")(x)
-    model = tf.keras.Model(inputs, outputs)
-    model.compile(optimizer="adam",
-                  loss="binary_crossentropy",
-                  metrics=["accuracy"])
-    return model
+    X_scaled = scaler.fit_transform(X)
+    return X_scaled, y, scaler, features, df
 
 def train_model():
     print("📥 Downloading US30 1min data...")
     us30 = yf.download("YM=F", period="7d", interval="1m")
     print(f"✅ Total candles: {len(us30)}")
     us30 = add_indicators(us30)
-    X, y, scaler, features, df = prepare_lstm_data(us30.copy())
+    X, y, scaler, features, df = prepare_data(us30.copy())
     split = int(len(X) * 0.8)
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
-    print("🧠 Training LSTM...")
-    model = build_lstm((X.shape[1], X.shape[2]))
-    es = EarlyStopping(monitor="val_loss", patience=15,
-                       restore_best_weights=True)
-    model.fit(X_train, y_train, epochs=100,
-              batch_size=64, validation_split=0.1,
-              callbacks=[es], verbose=0)
-    preds = (model.predict(X_test) > 0.5).astype(int).flatten()
+    print("🧠 Training AI model...")
+    model = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=4,
+        random_state=42)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
     acc = accuracy_score(y_test, preds)
     print(f"✅ Accuracy: {acc*100:.2f}%")
     return model, scaler, features, df, X
 
 def get_signal(model, X):
-    latest = X[-1].reshape(1, X.shape[1], X.shape[2])
-    prob = model.predict(latest, verbose=0)[0][0]
+    prob = model.predict_proba(X[-1].reshape(1, -1))[0][1]
     signal = "BUY" if prob > 0.5 else "SELL"
     confidence = prob if prob > 0.5 else 1 - prob
     return signal, confidence
@@ -160,29 +131,20 @@ def get_signal(model, X):
 def run_robot():
     print("\n🤖 US30 AI ROBOT STARTING...")
     print("="*40)
-
-    # Train model
     model, scaler, features, df, X = train_model()
-
-    # Retrain every 24 hours
     last_train = time.time()
 
     while True:
         try:
-            # Retrain every 24 hours
             if time.time() - last_train > 86400:
-                print("\n🔄 Retraining model with fresh data...")
+                print("\n🔄 Retraining with fresh data...")
                 model, scaler, features, df, X = train_model()
                 last_train = time.time()
 
-            # Get signal
             signal, confidence = get_signal(model, X)
-
-            # Get price info
             close = df["Close"].squeeze()
             current_price = close.iloc[-1]
             atr = df["ATR"].iloc[-1]
-
             sl = round(atr * 1.5, 2)
             tp = round(atr * 3.0, 2)
 
@@ -203,8 +165,6 @@ def run_robot():
             print(f"✅ Take Profit: {tp_price:.2f}")
             print(f"⚖️  RR Ratio   : 1:2")
             print("-"*40)
-
-            # Wait 1 minute before next signal
             time.sleep(60)
 
         except Exception as e:
